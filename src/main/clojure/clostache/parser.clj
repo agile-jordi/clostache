@@ -35,10 +35,20 @@
                        ["<" "&lt;"]
                        [">" "&gt;"]]))
 
-(defn- indent-partial
+(def ^:private new-line "\r\n|[\r\n]")
+(def ^:private new-line-group (str "(" new-line ")"))
+(def ^:private eol-start-group (str "(" new-line "|^)"))
+(def ^:private eol-end-group (str "(" new-line "|$)"))
+(def ^:private moustache-open "\\{\\{")
+(def ^:private moustache-close "\\}\\}")
+(def ^:private spaces "[ \t]*")
+(defn- moustache [& s] (str moustache-open (reduce str s) moustache-close))
+(def ^:private moustache-contents "[^\\}]*")
+
+  (defn- indent-partial
   "Indent all lines of the partial by indent."
   [partial indent]
-  (replace-all partial [["(\r\n|[\r\n])(.+)" (str "$1" indent "$2") true]]))
+  (replace-all partial [[(str new-line-group "(.+)") (str "$1" indent "$2") true]]))
 
 (def regex-chars ["\\" "{" "}" "[" "]" "(" ")" "." "?" "^" "+" "-" "|"])
 
@@ -58,19 +68,19 @@
   [^String template data]
   (let [builder (StringBuilder. template)
         data (atom data)
-        open-delim (atom "\\{\\{")
-        close-delim (atom "\\}\\}")
+        open-delim (atom moustache-open)
+        close-delim (atom moustache-close)
         set-delims (fn [open close]
                      (doseq [[var delim]
                              [[open-delim open] [close-delim close]]]
                        (swap! var (constantly (escape-regex delim)))))]
     (loop [offset 0]
       (let [string (.toString builder)
-            custom-delim (not (= "\\{\\{" @open-delim))
+            custom-delim (not (= moustache-open @open-delim))
             matcher (re-matcher
                      (re-pattern (str "(" @open-delim ".*?" @close-delim
                                       (if custom-delim
-                                        (str "|\\{\\{.*?\\}\\}"))
+                                        (str "|" (moustache ".*?")))
                                       ")"))
                      string)]
         (if (.find matcher offset)
@@ -83,7 +93,7 @@
               (if-let [tag (re-find #"\{\{(.*?)\}\}" match)]
                 (do
                   (.replace builder match-start match-end
-                            (str "\\{\\{" (second tag) "\\}\\}"))
+                            (moustache (second tag)))
                   (recur match-end)))
               (if-let [delim-change (re-find
                                      (re-pattern (str @open-delim
@@ -107,8 +117,8 @@
                         key (if section-start (keyword (second section-start)))
                         value (if key (key @data))]
                     (if (and value (fn? value)
-                             (not (and (= @open-delim "\\{\\{")
-                                       (= @close-delim "\\}\\}"))))
+                             (not (and (= @open-delim moustache-open)
+                                       (= @close-delim moustache-close))))
                       (swap! data
                              #(update-in % [key]
                                          (fn [old]
@@ -129,10 +139,10 @@
   [template partials]
   (apply concat
          (for [k (keys partials)]
-           (let [regex (re-pattern (str "(\r\n|[\r\n]|^)([ \\t]*)\\{\\{>\\s*"
-                                        (name k) "\\s*\\}\\}"))
+           (let [regex (re-pattern (str eol-start-group "(" spaces ")"
+                                     (moustache ">\\s*" (name k) "\\s*")))
                  indent (nth (first (re-seq (re-pattern regex) template)) 2)]
-             [[(str "\\{\\{>\\s*" (name k) "\\s*\\}\\}")
+             [[(moustache ">\\s*" (name k) "\\s*")
                (first (process-set-delimiters (indent-partial (str (k partials))
                                                               indent) {}))]]))))
 
@@ -144,9 +154,8 @@
 (defn- remove-comments
   "Removes comments from the template."
   [template]
-  (let [comment-regex "\\{\\{\\![^\\}]*\\}\\}"]
-    (replace-all template [[(str "(^|[\n\r])[ \t]*" comment-regex
-                                 "(\r\n|[\r\n]|$)") "$1" true]
+  (let [comment-regex (moustache "\\!" moustache-contents)]
+    (replace-all template [[(str "(^|[\n\r])" spaces comment-regex eol-end-group ) "$1" true]
                            [comment-regex ""]])))
 
 (defn- next-index
@@ -206,7 +215,7 @@
 (defn- remove-all-tags
   "Removes all tags from the template."
   [^String template]
-  (replace-all template [["\\{\\{\\S*\\}\\}" ""]]))
+  (replace-all template [[(moustache "\\S*") ""]]))
 
 (defn- replace-all-callback
   "Replaces each occurrence of the regex with the return value of the callback."
@@ -249,10 +258,8 @@
   [template]
   (replace-all
    template
-   (let [eol-start "(\r\n|[\r\n]|^)"
-         eol-end "(\r\n|[\r\n]|$)"]
-     [[(str eol-start "[ \t]*(\\{\\{=[^\\}]*\\}\\})" eol-end) "$1$2"
-       true]])))
+     [[(str eol-start-group spaces "(" (moustache "=" moustache-contents ) ")" eol-end-group) "$1$2"
+       true]]))
 
 (defn- path-data
   "Extract the data for the supplied path."
@@ -321,16 +328,15 @@
   [template]
   (replace-all
    template
-   (let [eol-start "(\r\n|[\r\n]|^)"
-         eol-end "(\r\n|[\r\n]|$)"]
-     [[(str eol-start
-            "\\{\\{[#\\^][^\\}]*\\}\\}(\r\n|[\r\n])\\{\\{/[^\\}]*\\}\\}"
-            eol-end)
+     [[(str eol-start-group
+            (str (moustache "[#\\^]" moustache-contents) new-line-group (moustache "/" moustache-contents))
+            eol-end-group)
        "$1" true]
-      [(str eol-start "[ \t]*(\\{\\{[#\\^/][^\\}]*\\}\\})" eol-end) "$1$2"
+      [(str eol-start-group spaces "(" (moustache "[#\\^/]" moustache-contents) ")" eol-end-group) "$1$2"
        true]
-      [(str eol-start "([ \t]*\\{\\{>\\s*[^\\}]*\\s*\\}\\})" eol-end) "$1$2"
-       true]])))
+      [(str eol-start-group "(" spaces (moustache ">\\s*" moustache-contents) ")" eol-end-group) "$1$2"
+      ;; Was: [(str eol-start-group "(" spaces (moustache ">\\s*" moustache-contents "\\s*") ")" eol-end-group) "$1$2"
+       true]]))
 
 (defn- preprocess
   "Preprocesses template and data (e.g. removing comments)."
